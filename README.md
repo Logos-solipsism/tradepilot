@@ -1,8 +1,11 @@
 # tradepilot —— 电商 AI 导购与检索服务
 
+![CI](https://github.com/Logos-solipsism/tradepilot/actions/workflows/ci.yml/badge.svg) ![Python](https://img.shields.io/badge/Python-3.12-3776AB) ![FastAPI](https://img.shields.io/badge/FastAPI-0.162-009688) ![License](https://img.shields.io/badge/license-MIT-green)
+
 链路：浏览器 → Java 后端 (Spring Boot, :18090) → **本服务 (FastAPI, :8010)** → 大模型。
 Java 不直接调大模型，所有 LLM 调用都发生在这里。`/chat` 与 `/search` 的调用方永远是
 Java，不是浏览器；两个接口都必须带 Java 签发的内部票据。
+Java 侧仓库：[Logos-solipsism/trademall](https://github.com/Logos-solipsism/trademall)（本服务只被它调用，不直接面向浏览器）。
 
 ## 已实现
 - 内部票据校验（Java → Python 的唯一信任凭据，fail-closed）

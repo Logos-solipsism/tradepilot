@@ -1,0 +1,31 @@
+# tradepilot CI：只跑离线单元测试
+#
+# 为什么 CI 里不需要 MySQL / Redis / 大模型 key：测试全部离线，LLM 调用用 httpx.MockTransport
+# 注入假响应，商品目录用假 client 注入，不起任何真实网络请求与中间件。
+# 不要往这个 workflow 里加 MySQL / Redis / 大模型 key 之类的中间件或密钥步骤。
+# 也不加 lint / type-check / 覆盖率步骤：项目里没有 ruff / mypy 配置，加了必然红。
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: 安装依赖
+        run: pip install -r requirements-dev.txt
+
+      - name: 离线单元测试
+        run: python -m pytest -q
