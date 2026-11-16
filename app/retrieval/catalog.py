@@ -274,6 +274,16 @@ class CatalogIndex:
         self._last_refreshed_at: float | None = None
 
     @property
+    def cached_docs(self) -> list[ProductDoc] | None:
+        """已经拉到的那份快照；没拉过就是 None。
+
+        **绝不触发拉取**——探活/观测用它，不能因为有人看健康检查就去打上游。
+        返回的是同一个 list 对象，所以调用方拿它去比身份（VectorCache 的换代判据）
+        是安全的：CatalogIndex 每次刷新都会换成新对象。
+        """
+        return self._docs
+
+    @property
     def indexed_count(self) -> int:
         return len(self._docs) if self._docs is not None else 0
 

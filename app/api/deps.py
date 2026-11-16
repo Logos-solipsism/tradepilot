@@ -10,6 +10,7 @@ from app.config import Settings
 from app.errors import TicketInvalidError
 from app.llm.client import LlmClient
 from app.retrieval.catalog import CatalogClient, CatalogIndex
+from app.retrieval.vector_cache import VectorCache, build_vector_cache
 from app.security.ticket import TicketError, verify
 from app.session.base import SessionStore
 from app.tools.catalog_tools import CatalogToolbox
@@ -45,6 +46,22 @@ def get_catalog_index(request: Request) -> CatalogIndex:
         index = CatalogIndex(client, ttl_seconds=settings.catalog_cache_ttl_seconds)
         request.app.state.catalog_index = index
     return index
+
+
+def get_vector_cache(request: Request) -> VectorCache:
+    """第三路的缓存（文档向量 + query 向量），通常由 create_app 建好。
+
+    与 `_Bm25Cache` 不同的地方：这一份由应用装配时建好并挂在 state 上，因为它是
+    `build_embedder` 决定的结果——"有没有配 EMBEDDING_API_KEY"必须在**启动日志**里
+    就喊出来，等到第一个请求才喊就等于线上降级跑了很久才被看见。
+    构造本身不发任何请求（文档向量是按需在后台建的），所以放在装配期不拖慢启动。
+    """
+    cache = getattr(request.app.state, "vector_cache", None)
+    if cache is None:
+        # 极端场景（没走 create_app 的装配）：就地补一份，WARNING 同样会打
+        cache = build_vector_cache(request.app.state.settings)
+        request.app.state.vector_cache = cache
+    return cache
 
 
 async def require_ticket(

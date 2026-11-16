@@ -85,3 +85,8 @@ class HealthData(BaseModel):
     sessions: Literal["memory", "redis"]
     # ready = 索引里已有商品；empty = 还没建起来或上游真的没有商品
     search: Literal["ready", "empty"] = "empty"
+    # 向量第三路用的是真 embedding 还是哈希降级。
+    # off = 本进程还没建过向量索引（探活不建索引，所以刚启动时一定是 off）
+    vector: Literal["real", "fake", "off"] = "off"
+    # 本代目录的向量路状态；building = 后台正在建，此时 /search 走两路
+    vector_state: Literal["idle", "building", "ready", "degraded"] = "idle"

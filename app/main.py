@@ -13,6 +13,7 @@ from app.config import Settings, get_settings
 from app.errors import AppError
 from app.llm.client import LlmClient
 from app.retrieval.catalog import CatalogClient, CatalogIndex
+from app.retrieval.vector_cache import build_vector_cache
 from app.session.base import SessionStore
 from app.session.factory import create_session_store
 
@@ -61,6 +62,10 @@ def create_app(
     app.state.catalog_client = catalog_client
     # 索引在 lifespan 里按注入的 client 建；测试可直接覆盖 app.state.catalog_index
     app.state.catalog_index = None
+    # 第三路的缓存（文档向量 + query 向量）。在**装配期**就建：它决定"向量路是真的
+    # 还是哈希降级"，这件事必须在启动日志里就能看见，不能等第一个请求才喊。
+    # 构造不发请求、不建索引（文档向量按需在后台线程建），所以这里不拖慢启动。
+    app.state.vector_cache = build_vector_cache(resolved)
 
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:

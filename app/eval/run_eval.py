@@ -3,7 +3,8 @@
 用法（在 tradepilot 根目录）：
     python -m app.eval.run_eval                    # BM25 单路，全量 100 条
     python -m app.eval.run_eval --mode fused       # BM25 + 泛化词 RRF 融合
-    python -m app.eval.run_eval --mode fused --split holdout
+    python -m app.eval.run_eval --mode fused3      # 再加向量路（三路融合）
+    python -m app.eval.run_eval --mode fused3 --split holdout
 
 `--mode` 决定用哪条检索路径，`--split` 决定在哪个子集上算指标
 （dev/holdout 由 `dev_holdout_split` 按 sha256 首字符奇偶确定性切分，
@@ -32,6 +33,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
+from app.config import Settings, get_settings
 from app.eval.fixture_catalog import build_fixture_catalog
 from app.eval.labels import GROUPS, QUERIES, EvalQuery
 from app.eval.metrics import (
@@ -43,13 +45,17 @@ from app.eval.metrics import (
     recall_at_k,
 )
 from app.retrieval.bm25 import BM25Index, RRF_K_DEFAULT
+from app.retrieval.embedding import build_embedder
+from app.retrieval.vector import VectorIndex
 
 TOP_K = 10
 DETAIL_HEAD = 3
 
 # 两路检索的统一签名：给 query 返回 [(doc, score)]，score 的量纲由实现自己决定
 Searcher = Callable[[str, int], list]
-MODES: tuple[str, ...] = ("bm25", "fused")
+# 三路：bm25 = 单路；fused = 原文 BM25 + 泛化词 BM25；fused3 = 再并上向量余弦。
+# 名字不能复用 fused：同一行摘要里要能一眼分清"两路"与"三路"这两份数字。
+MODES: tuple[str, ...] = ("bm25", "fused", "fused3")
 SPLITS: tuple[str, ...] = ("all", "dev", "holdout")
 
 # 字面难度分档：(档名, 下界含, 上界不含)；上界 None = 无上界
@@ -58,6 +64,13 @@ LEXICAL_BANDS: tuple[tuple[str, float, float | None], ...] = (
     ("paraphrase-mid", LEXICAL_MID, LEXICAL_HIGH),
     ("paraphrase-semantic", 0.0, LEXICAL_MID),
 )
+
+# 报告头里的路径名；新加 mode 忘了登记会退回显示 mode 本身，不会打错成别的路
+MODE_LABELS: dict[str, str] = {
+    "bm25": "BM25",
+    "fused": "BM25+扩展词 RRF",
+    "fused3": "BM25+扩展词+向量 三路 RRF",
+}
 
 
 @dataclass(frozen=True)
@@ -118,17 +131,25 @@ def evaluate(
     *,
     mode: str = "bm25",
     rrf_k: int = RRF_K_DEFAULT,
+    vectors: VectorIndex | None = None,
 ) -> list[QueryResult]:
     """对每条 query 取 top_k 并算三个指标；纯函数，不打印。
 
     `mode` 只影响取候选的那一步：指标计算、分组、分档全部共用同一套代码，
-    这样 bm25 与 fused 两个数字的差异只可能来自检索本身。
+    这样 bm25 / fused / fused3 三份数字的差异只可能来自检索本身。
+
+    `vectors` 只在 mode="fused3" 时必须给：**不给就报错，不偷偷退化成两路**——
+    悄悄降级会让 fused3 那一行看起来"向量路没用"，而真相是它根本没跑。
     """
     if mode not in MODES:
         raise ValueError(f"未知 mode: {mode!r}（可选 {', '.join(MODES)}）")
+    if mode == "fused3" and vectors is None:
+        raise ValueError("mode=fused3 需要传入向量索引 vectors")
     results: list[QueryResult] = []
     for item in queries:
-        if mode == "fused":
+        if mode == "fused3":
+            hits = index.search_fused_three(item.query, vectors, top_k=top_k, rrf_k=rrf_k)
+        elif mode == "fused":
             hits = index.search_fused(item.query, top_k=top_k, rrf_k=rrf_k)
         else:
             hits = index.search(item.query, top_k=top_k)
@@ -224,14 +245,19 @@ def format_report(
     lexical_bands: list[GroupResult] | None = None,
     mode: str = "bm25",
     split: str = "all",
+    vector_label: str = "",
 ) -> list[str]:
     lines: list[str] = []
-    mode_label = "BM25" if mode == "bm25" else "BM25+扩展词 RRF"
+    mode_label = MODE_LABELS.get(mode, mode)
     lines.append("=" * 78)
     lines.append(
         f"Tradepilot 离线检索评估 | {mode_label} | top-{top_k} | "
         f"{n_docs} 条固定商品 / {len(results)} 条 query | split={split}"
     )
+    if mode == "fused3":
+        # 向量路是哈希降级还是真模型，必须写在报告头里：
+        # 同一行数字换个 embedder 就不可比，不标注等于让读者猜
+        lines.append(f"向量路: {vector_label}")
     lines.append("=" * 78)
 
     failures = [r for r in results if r.recall < 1.0]
@@ -295,13 +321,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     """只解析命令行；抽成函数便于测试直接喂 argv 列表。"""
     parser = argparse.ArgumentParser(
         prog="python -m app.eval.run_eval",
-        description="Tradepilot 离线检索评估：BM25 单路 vs 泛化词 RRF 融合。",
+        description="Tradepilot 离线检索评估：BM25 单路 vs 两路 RRF vs 三路 RRF。",
     )
     parser.add_argument(
         "--mode",
         choices=MODES,
         default="bm25",
-        help="检索路径：bm25 = 单路（默认，与改动前等价）；fused = BM25 + 扩展词 RRF",
+        help=(
+            "检索路径：bm25 = 单路（默认，与改动前等价）；"
+            "fused = BM25 + 扩展词 RRF；fused3 = 再加向量余弦的三路 RRF"
+        ),
     )
     parser.add_argument(
         "--split",
@@ -312,15 +341,32 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def build_vector_index(docs: list, settings: Settings | None = None) -> VectorIndex:
+    """按当前配置建向量索引：有 EMBEDDING_API_KEY 走真模型，没有走哈希降级。
+
+    单独成函数是为了让测试能注入 embedder——真打一次 bge-m3 要联网，
+    而"离线评估"的前提就是断网也能跑出同一份数字。
+    """
+    resolved = settings if settings is not None else get_settings()
+    return VectorIndex(docs, build_embedder(resolved))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     docs = build_fixture_catalog()
     index = BM25Index(docs)
     titles = {doc.id: doc.title for doc in docs}
     queries = select_split(QUERIES, args.split)
-    results = evaluate(index, queries, top_k=TOP_K, mode=args.mode)
+    # 只有 fused3 才建向量索引：bm25/fused 的基线数字必须与"向量路存在之前"逐字一致，
+    # 连"多建了一个没人用的索引"这种副作用都不要留下
+    vectors = build_vector_index(docs) if args.mode == "fused3" else None
+    results = evaluate(index, queries, top_k=TOP_K, mode=args.mode, vectors=vectors)
     groups = summarise(results)
     bands = summarise_lexical_bands(results, titles)
+    vector_label = ""
+    if vectors is not None:
+        suffix = "（哈希降级，无语义能力）" if vectors.is_fake else "（真实 embedding）"
+        vector_label = f"{vectors.embedder_name} dim={vectors.dimension}{suffix}"
     report = format_report(
         results,
         groups,
@@ -329,6 +375,7 @@ def main(argv: list[str] | None = None) -> int:
         lexical_bands=bands,
         mode=args.mode,
         split=args.split,
+        vector_label=vector_label,
     )
     # 控制台可能是 GBK；统一按 UTF-8 写，避免中文乱码
     sys.stdout.reconfigure(encoding="utf-8")

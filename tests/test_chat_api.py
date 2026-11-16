@@ -11,11 +11,23 @@ from app.config import Settings
 from app.errors import UpstreamError
 from app.llm.client import FAKE_ANSWER, LlmClient
 from app.main import create_app
+from app.retrieval.catalog import ProductDoc
+from app.retrieval.embedding import HashingEmbedder
+from app.retrieval.vector_cache import VectorCache
 from app.security import ticket as ticket_mod
 from app.security.ticket import sign
 from app.session.memory import MemorySessionStore
 
 SECRET = "test-secret"
+
+
+class _FakeEmbedder(HashingEmbedder):
+    """可控的哈希 embedder：只为了让 /health 能区分 real / fake 两种向量路。"""
+
+    def __init__(self, is_fake: bool = True) -> None:
+        super().__init__(64)
+        self.is_fake = is_fake
+        self.name = "fake-64" if is_fake else "fake-real-64"
 
 
 class _StubLlm:
@@ -98,6 +110,9 @@ def test_health_has_no_ticket_requirement():
         "version": "0.1.0",
         "sessions": "memory",
         "search": "empty",
+        # 探活不建索引、不打上游：进程刚起来时向量路还没跑过，如实报 off/idle
+        "vector": "off",
+        "vector_state": "idle",
     }
 
 
@@ -106,6 +121,73 @@ def test_health_reports_real_when_key_configured():
         c.app.state.llm_client.is_fake = False
         r = c.get("/health")
     assert r.json()["llm"] == "real"
+
+
+def _catalog_with_docs(c, docs):
+    """把目录直接塞进 CatalogIndex 的缓存（模拟"已经拉过一次"）。
+
+    不调 docs()：那个方法会走 CatalogClient，而它没配 token 时是 fail-closed。
+    这里要验的是 /health 的只读展示，不该顺带验证上游拉取。
+    """
+    catalog = c.app.state.catalog_index
+    catalog._docs = list(docs)
+    catalog._last_refreshed_at = time.time()
+    return catalog
+
+
+def test_health_reports_vector_off_before_any_index():
+    """探活不许触发建索引：没建过就是 off/idle，绝不能在 /health 里打上游。"""
+    with make_client() as c:
+        cache = VectorCache(_FakeEmbedder(), auto_build=True)
+        c.app.state.vector_cache = cache
+        j = c.get("/health").json()
+        assert j["vector"] == "off"
+        assert j["vector_state"] == "idle"
+        # 连读两次都不许把后台建索引叫起来
+        c.get("/health")
+        assert cache.peek(c.app.state.catalog_index.cached_docs) is None
+
+
+def test_health_reports_vector_fake_and_ready_after_build():
+    """哈希降级在线上必须能从 /health 看出来——这是日志之外唯一的自动发现路径。"""
+    docs = [ProductDoc(id=i, title="商品%d 测试" % i) for i in range(1, 4)]
+    with make_client() as c:
+        catalog = _catalog_with_docs(c, docs)
+        cache = VectorCache(_FakeEmbedder(), auto_build=False)
+        c.app.state.vector_cache = cache
+        cache.build_now(catalog.cached_docs)
+        j = c.get("/health").json()
+        assert j["vector"] == "fake"
+        assert j["vector_state"] == "ready"
+        assert j["search"] == "ready"
+
+
+def test_health_reports_vector_real_when_embedder_is_real():
+    docs = [ProductDoc(id=i, title="商品%d 测试" % i) for i in range(1, 4)]
+    with make_client() as c:
+        catalog = _catalog_with_docs(c, docs)
+        cache = VectorCache(_FakeEmbedder(is_fake=False), auto_build=False)
+        c.app.state.vector_cache = cache
+        cache.build_now(catalog.cached_docs)
+        assert c.get("/health").json()["vector"] == "real"
+
+
+def test_health_reports_degraded_when_build_fails():
+    """/health 要能回答"这台机器现在是不是一直在降级"。"""
+
+    class _Boom(_FakeEmbedder):
+        def embed(self, texts):
+            raise UpstreamError("embedding 上游返回 HTTP 503")
+
+    docs = [ProductDoc(id=i, title="商品%d 测试" % i) for i in range(1, 4)]
+    with make_client() as c:
+        catalog = _catalog_with_docs(c, docs)
+        cache = VectorCache(_Boom(), auto_build=False)
+        c.app.state.vector_cache = cache
+        assert cache.build_now(catalog.cached_docs) is None
+        j = c.get("/health").json()
+        assert j["vector"] == "fake"
+        assert j["vector_state"] == "degraded"
 
 
 def test_chat_without_ticket_is_real_401():

@@ -4,15 +4,32 @@
 没有上限就是一次请求无限次打上游、按 token 无限计费。MAX_TOOL_ROUNDS = 3 意味着
 一次 /chat 最多 1 + 3 = 4 次模型调用，成本上界是可算的。
 
+编排用 LangGraph 的 StateGraph 而不是手写 for 循环：三个节点各管一件事 ——
+plan（带工具问模型一次）/ act（把模型要的工具执行掉并回灌结果）/ finalize（收口，
+只要文字）。"还要不要再来一轮"由条件边回答，而不是靠循环变量和 break，
+这样每条退出路径在图里都是显式的：要么 answer 有值走到 END，要么落进 finalize。
+
+recursion_limit 与实际模型调用次数的换算（必须写死在这里，否则上限会悄悄失效）：
+LangGraph 的一"超步"就是"一个节点执行一次"，它按超步计数，超步数达到 limit
+时再要往下走就抛 GraphRecursionError（实测：某条路径要跑 N 个节点时，
+limit = N 会报错、limit = N + 1 才通过 —— END 那次判定也算一步）。
+最坏路径是跑满 max_rounds 都没收敛：plan, act, plan, act, …, plan, act, finalize，
+共 2 * max_rounds + 1 个超步，所以下面取 2 * max_rounds + 2 正好够且不宽。
+模型调用只发生在 plan 和 finalize 里，于是"超步上界"换算出的"调用上界"是
+(max_rounds 次 plan + 1 次 finalize) = 1 + max_rounds 次，与手写版本逐字一致。
+
 这里不碰会话存储：历史怎么落盘是 router 的事；本模块只负责"这一轮对话怎么跑完"。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TypedDict
+
+from langgraph.graph import END, StateGraph
 
 from app.agent.prompt import SYSTEM_PROMPT
-from app.llm.client import LlmClient, LlmUsage
+from app.llm.client import LlmClient, LlmUsage, ToolCall
 from app.tools.catalog_tools import TOOL_SPECS, CatalogToolbox
 
 MAX_TOOL_ROUNDS = 3
@@ -63,6 +80,23 @@ def _assistant_message(content: str, tool_calls: list) -> dict:
     }
 
 
+class _LoopState(TypedDict):
+    """图里流动的状态：只放"这一轮对话的数据"。
+
+    llm / toolbox 这类活对象绝不进 state：它们既没法序列化，也不该因为换了编排方式
+    就换持有人。用闭包把它们捕获在节点函数里，state 只记对话本身
+    （消息、待执行的调用、已用轮次、审计、累计用量、最终答案）。
+    所有节点都返回"新值"而不是就地改列表，免得 state 里的引用被上一轮改写。
+    """
+
+    messages: list[dict]
+    pending: list[ToolCall]
+    rounds: int
+    traces: list[ToolTrace]
+    usage: LlmUsage
+    answer: str
+
+
 async def run_tool_loop(
     llm: LlmClient,
     toolbox: CatalogToolbox,
@@ -80,33 +114,93 @@ async def run_tool_loop(
     ]
 
     if getattr(llm, "is_fake", False):
-        # fake 模式不该假装调工具：不发 tools，也就不会有 tool_calls
+        # fake 模式不该假装调工具：不发 tools，也就不会有 tool_calls。
+        # 它一次 complete 就结束，没有"循环"可编排，所以直接短路、不进图 ——
+        # 硬画成单节点图只是装饰，还会让"绝不发 tools"这条多绕一道手。
         result = await llm.complete(messages)
         return ChatOutcome(answer=result.content, tool_calls=[], usage=result.usage)
 
-    traces: list[ToolTrace] = []
-    usage = LlmUsage()
-
-    for _ in range(max_rounds):
-        result = await llm.complete(messages, tools=TOOL_SPECS)
-        usage = _plus(usage, result.usage)
+    async def _plan(state: _LoopState) -> dict:
+        """带工具问模型一次。它要么要调工具，要么直接给答案。"""
+        result = await llm.complete(state["messages"], tools=TOOL_SPECS)
+        usage = _plus(state["usage"], result.usage)
         if not result.tool_calls:
-            return ChatOutcome(answer=result.content, tool_calls=traces, usage=usage)
+            # 收敛了：answer 落进 state，条件边据此走到 END
+            return {"usage": usage, "answer": result.content, "pending": []}
+        # 先把 assistant 轮回灌进上下文（工具结果要跟在它后面），再把待执行的调用
+        # 交给 act —— 顺序与手写版本一致：assistant 一轮、随后每个工具一条 tool 消息。
+        return {
+            "usage": usage,
+            "messages": [*state["messages"], _assistant_message(result.content, result.tool_calls)],
+            "pending": list(result.tool_calls),
+        }
 
-        messages.append(_assistant_message(result.content, result.tool_calls))
-        for call in result.tool_calls:
+    async def _act(state: _LoopState) -> dict:
+        """逐个执行模型要的工具，结果按 OpenAI 格式回灌。"""
+        traces = list(state["traces"])
+        messages = list(state["messages"])
+        for call in state["pending"]:
             text, ok = await toolbox.invoke(call.name, call.arguments)
+            # 工具失败也照样进审计：ok=False 是给调用方的证据，不是中断理由
             traces.append(ToolTrace(name=call.name, arguments=call.arguments, ok=ok))
-            messages.append(
-                {"role": "tool", "tool_call_id": call.id, "content": text}
-            )
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": text})
+        return {
+            "messages": messages,
+            "traces": traces,
+            "pending": [],
+            "rounds": state["rounds"] + 1,
+        }
 
-    # 用满轮次还没收敛：再问一次，只要文字。这次即使又给 tool_calls 也忽略，
-    # 否则"上限"形同虚设 —— 必须有一次是无论如何都要收口的。
-    final = await llm.complete(messages, tools=TOOL_SPECS)
-    usage = _plus(usage, final.usage)
+    async def _finalize(state: _LoopState) -> dict:
+        """用满轮次还没收敛：再问一次，只要文字。
+
+        这次即使又给 tool_calls 也忽略，否则"上限"形同虚设 ——
+        必须有一次是无论如何都要收口的，所以这里既不执行工具、也不回灌 assistant 轮。
+        复用 CALL 的 tools 参数与手写版本保持一致（上游请求体逐字不变），
+        只是把回复里的 tool_calls 丢掉。
+        """
+        result = await llm.complete(state["messages"], tools=TOOL_SPECS)
+        return {
+            "usage": _plus(state["usage"], result.usage),
+            "answer": result.content or MAX_ROUNDS_ANSWER,
+        }
+
+    def _after_plan(state: _LoopState) -> str:
+        """有待执行的工具就去 act，否则模型已经给了答案，收工。"""
+        return "act" if state["pending"] else "done"
+
+    def _after_act(state: _LoopState) -> str:
+        """轮次没用完就再问一轮，用完了就去收口。"""
+        return "finalize" if state["rounds"] >= max_rounds else "plan"
+
+    workflow = StateGraph(_LoopState)
+    workflow.add_node("plan", _plan)
+    workflow.add_node("act", _act)
+    workflow.add_node("finalize", _finalize)
+    # max_rounds <= 0 表示一轮都不许跑，直接收口：入口就是 finalize，
+    # 等价于手写版本里 range(0) 一次都不执行、直接落到兜底那次 complete。
+    workflow.set_entry_point("plan" if max_rounds > 0 else "finalize")
+    workflow.add_conditional_edges("plan", _after_plan, {"act": "act", "done": END})
+    workflow.add_conditional_edges("act", _after_act, {"plan": "plan", "finalize": "finalize"})
+    workflow.add_edge("finalize", END)
+
+    final_state = await workflow.compile().ainvoke(
+        {
+            "messages": messages,
+            "pending": [],
+            "rounds": 0,
+            "traces": [],
+            "usage": LlmUsage(),
+            "answer": "",
+        },
+        # 上界换算见模块 docstring：最坏 2 * max_rounds + 1 个超步，limit 要再 +1。
+        # 兜底 max(..., 2)：max_rounds <= 0 时路径只剩 finalize 一个超步，而 LangGraph
+        # 要求 limit >= 1 且"刚好等于超步数"仍会报错，所以给到 2 才是那条路径的最小可用值。
+        config={"recursion_limit": max(2, 2 * max_rounds + 2)},
+    )
+
     return ChatOutcome(
-        answer=final.content or MAX_ROUNDS_ANSWER,
-        tool_calls=traces,
-        usage=usage,
+        answer=final_state["answer"],
+        tool_calls=final_state["traces"],
+        usage=final_state["usage"],
     )

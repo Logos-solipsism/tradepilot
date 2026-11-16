@@ -3,3 +3,8 @@ uvicorn>=0.27,<1
 pydantic>=2.5,<3
 httpx>=0.27,<1
 redis>=5,<7
+# 向量召回第三路：faiss 做归一化向量 + 内积 top-k，numpy 只用来建矩阵
+# 刻意**不引 chromadb**：它在本机（Windows + 它的 Rust binding）任何路径都起不来
+# （unable to open database file），而这里需要的只是"暴力全扫 + 余弦 top-k"。
+numpy>=1.26,<3
+faiss-cpu>=1.8,<2

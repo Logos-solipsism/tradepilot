@@ -13,7 +13,9 @@ from app.llm.client import FAKE_ANSWER, LlmResult, LlmUsage
 from app.main import create_app
 from app.retrieval.bm25 import BM25Index
 from app.retrieval.catalog import ProductDoc
+from app.retrieval.embedding import HashingEmbedder
 from app.retrieval.expand import expand_query
+from app.retrieval.vector_cache import VectorCache
 from app.security import ticket as ticket_mod
 from app.security.ticket import sign
 from app.session.memory import MemorySessionStore
@@ -66,12 +68,21 @@ def _clean_nonces():
     ticket_mod.reset_nonce_cache()
 
 
-def make_client(catalog=None) -> TestClient:
+def make_client(catalog=None, vector_cache=None) -> TestClient:
     app = create_app(
         Settings(internal_secret=SECRET, llm_api_key=""),
         llm_client=_StubLlm(),
         session_store=MemorySessionStore(),
         catalog_client=catalog or _StubCatalog(),
+    )
+    # 向量路默认**不自动建索引**：建索引是后台线程，会让"第一次请求走两路、
+    # 第二次走三路"的路由切换发生在同一个用例里，使跨请求的断言变成时序依赖。
+    # 本文件的用例都是两路契约（接入三路之前就在跑的那些），所以这里把路由钉死在两路；
+    # 三路的路由与降级在 tests/test_search_vector_route.py 里用显式注入的缓存单独验。
+    app.state.vector_cache = (
+        vector_cache
+        if vector_cache is not None
+        else VectorCache(HashingEmbedder(Settings().embedding_dimension), auto_build=False)
     )
     return TestClient(app)
 

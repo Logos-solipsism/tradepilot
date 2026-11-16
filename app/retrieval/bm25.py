@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from app.retrieval.catalog import ProductDoc
 from app.retrieval.expand import expand_query
 from app.retrieval.tokenize import tokenize
+
+if TYPE_CHECKING:  # 只用于类型标注：运行时绝不把 numpy/faiss 拖进 BM25 的导入路径
+    from app.retrieval.vector import VectorIndex
 
 K1_DEFAULT = 1.5
 B_DEFAULT = 0.75
@@ -223,3 +227,107 @@ class BM25Index:
             if len(results) >= top_k:
                 break
         return results
+
+    def search_fused_three(
+        self,
+        query: str,
+        vectors: "VectorIndex",
+        top_k: int = 10,
+        *,
+        rrf_k: int = RRF_K_DEFAULT,
+    ) -> list[tuple[ProductDoc, float]]:
+        """三路 RRF 融合：原文 BM25 + 泛化词 BM25 + 向量余弦。
+
+        前两路**逐字复用** search_fused 的两路（同一份 expand_query、同一个 depth、
+        同一个 _score_tokens），这里只是把同一个融合循环再跑一路。没有另起一套打分：
+        三路如果各写一遍，日后改融合公式就要改三处，迟早改漏一处。
+
+        第三路是向量检索的名次。它与前两路**同权**（每路各 1/(rrf_k+rank)）：
+        RRF 的作用就是让不同量纲的路只按名次投票，给向量单独调权重就退回
+        「手工调参」，而那需要一份比 100 条 query 大得多的评估集才站得住。
+        权重留给后续刀，用评估集说话。
+
+        RRF 天然保护精确匹配：一条 exact query 在原文 BM25 上排第一拿 1/(k+1)，
+        向量路即使把某个近义商品也排第一，也只是同样的一份票，**不会盖过**原文路的命中。
+        向量路只能加票、不能改票，所以向量噪声不会把精确匹配挤出去。
+
+        补位规则与 search_fused 逐字一致：融合池不足 top_k 时按第一路完整 BM25 排序补，
+        补位项融合分记 0.0（理由同 search_fused：0.0 必然排在所有 >0 的 RRF 分之后）。
+
+        **文档集一致性守卫（覆盖整个方法，含所有短路返回）**：三条路必须建立在
+        同一份文档快照上。若向量索引与 BM25 索引的 id 集合不一致，说明其中一份已经过期
+        （典型场景：商品目录刷新了、向量索引还是上一版），此时向量路会把**不属于本次快照
+        的商品**当成本次检索结果返回——那是"返回了错误商品"，不是性能问题。
+
+        这里**抛错而不是静默过滤**掉那些外部 doc：过滤掉之后一切看起来都正常，索引过期
+        就变成一个永远不会被发现的慢性 bug——数字全对，直到某天用户发现搜出来的是别的
+        商品。抛错会在第一次不一致时就把问题顶到脸上，代价是一次显式的失败，
+        收益是这类错误不可能悄悄活下来。
+        """
+        # 守卫排在所有短路返回**之前**：索引不一致是调用方的结构性问题，
+        # 不该因为这一次恰好 top_k<=0、或这一次恰好一条都没匹配上就被静默跳过。
+        self._assert_same_doc_set(vectors)
+        if not self._docs or top_k <= 0:
+            return []
+        expansion = expand_query(query)
+        if not expansion.original_tokens:
+            return []
+
+        depth = min(RRF_DEPTH_DEFAULT, len(self._docs))
+        first_all = self._score_tokens(list(expansion.original_tokens), len(self._docs))
+        first = first_all[:depth]
+        second = self._score_tokens(list(expansion.expanded_tokens), depth)
+        # 向量路同样按 depth 截断名次：三条路的名次深度必须一致，
+        # 否则相对 top_k 恒定的排序性质会在这一路破功
+        third = vectors.search(query, depth)
+
+        scores: dict[int, float] = {}
+        docs_by_id: dict[int, ProductDoc] = {}
+        for ranking in (first, second, third):
+            for rank, (doc, _route_score) in enumerate(ranking, start=1):
+                scores[doc.id] = scores.get(doc.id, 0.0) + 1.0 / (rrf_k + rank)
+                docs_by_id.setdefault(doc.id, doc)
+
+        ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        results = [(docs_by_id[doc_id], score) for doc_id, score in ordered[:top_k]]
+        if len(results) >= top_k:
+            return results
+
+        seen = {doc.id for doc, _ in results}
+        for doc, _bm25_score in first_all:
+            if doc.id in seen:
+                continue
+            seen.add(doc.id)
+            results.append((doc, 0.0))
+            if len(results) >= top_k:
+                break
+        return results
+
+    def _assert_same_doc_set(self, vectors: "VectorIndex") -> None:
+        """三路融合的前置条件：向量索引与 BM25 索引必须是同一份文档快照。
+
+        比对用 **id 集合而不是条数**：条数相同但内容不同（目录里下架了 A、上架了 B）
+        同样会让向量路注入不属于本次快照的商品，只比条数会漏掉这一类。
+        条数与集合两个条件都查，是因为它们各自的失效方式不同：条数不同是最常见的
+        "整份索引过期"，条数相同而集合不同是"换了同量的一批商品"——后者更隐蔽。
+
+        报错信息先给两边的数量再给差异样例：过期时两边可能差出几百条，全列进异常消息
+        只会把关键信息淹掉，所以每边最多列 5 个 id。
+
+        这里**抛错而不是静默过滤**掉外部 doc：过滤掉之后一切看起来都正常，索引过期就
+        变成一个永远不会被发现的慢性 bug——数字全对，直到某天用户发现搜出来的是别的
+        商品。抛错会在第一次不一致时就把问题顶到脸上，代价是一次显式失败，
+        收益是这类错误不可能悄悄活下来。
+        """
+        ours = {doc.id for doc in self._docs}
+        theirs = set(vectors.doc_ids)
+        if self.n_docs == vectors.n_docs and ours == theirs:
+            return
+        foreign = sorted(theirs - ours)
+        missing = sorted(ours - theirs)
+        raise ValueError(
+            "向量索引与 BM25 索引的文档集不一致（向量索引已过期？）: "
+            f"BM25 {self.n_docs} 条 / 向量 {vectors.n_docs} 条；"
+            f"向量独有 {len(foreign)} 个 id {foreign[:5]}，"
+            f"BM25 独有 {len(missing)} 个 id {missing[:5]}"
+        )
